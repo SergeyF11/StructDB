@@ -32,7 +32,7 @@ public:
     constexpr PackedPhone() : dat{.raw = 0ULL} {}
 
     // Main constructor with validation
-    PackedPhone(uint64_t phone, uint8_t flags = 0, uint16_t group = 0) 
+    PackedPhone(uint64_t phone, uint8_t flags , uint16_t group = 0) 
         : dat{.raw = 0ULL}
     {
         if (phone <= MAX_NUM && group <= MAX_GROUP && flags <= MAX_FLAGS) {

@@ -497,7 +497,7 @@ public:
     uint8_t getLength() const { return length; }
     
     String toString() const override {
-        if (!data || length == 0) return String("");
+        if (!data || length == 0 || length > MAX_CHARS_LENGTH ) return String("");
         // Для ESP используем безопасный способ создания строки
         String result;
         result.reserve(length);

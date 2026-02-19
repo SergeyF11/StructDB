@@ -1,0 +1,262 @@
+/*
+ * StructDB — пример использования + анализ и предложения по улучшению
+ * =========================================================================
+ * Для ESP8266 / ESP32, LittleFS
+ */
+
+// ── Пример использования ────────────────────────────────────────────────────
+
+#include "StructCollection.h"
+#include "StructIndex.h"
+#include "CompactPhone.h"
+
+// 1. Определяем тип записи
+//    Запись: phone(uint64), name(string), group(uint16), flags(uint8)
+using PhoneRecord = Struct4<UInt64Entry, StringEntry, UInt16Entry, UInt8Entry>;
+
+// 2. Экземпляры коллекции и индексов
+StructCollection<PhoneRecord> db;
+
+// Индекс по номеру телефона (uint64)
+UInt64Index<PhoneRecord> phoneIdx([](const PhoneRecord& r) -> uint64_t {
+    return static_cast<uint64_t>(r.get<0>());
+});
+
+// Индекс по имени (String)
+StringIndex<PhoneRecord> nameIdx([](const PhoneRecord& r) -> String {
+    return r.get<1>().toString();
+});
+
+void setup() {
+    LittleFS.begin();
+
+    db.open("/phones.db");
+    db.attachIndex("phone", &phoneIdx);
+    db.attachIndex("name",  &nameIdx);
+
+    // Пробуем загрузить индексы с диска
+    if (!db.loadAllIndexes()) {
+        // Первый запуск — перестраиваем
+        db.rebuildAllIndexes();
+        db.saveAllIndexes();
+    }
+}
+
+// 3. Добавление записи
+void addPhone(uint64_t num, const char* name, uint16_t group, uint8_t flags) {
+    PhoneRecord rec;
+    rec.set<0>(num);
+    rec.set<1>(name);
+    rec.set<2>(group);
+    rec.set<3>(flags);
+    db.append(rec);
+}
+
+// 4. Поиск по телефону через индекс (O(log N), без чтения всего файла)
+bool findByPhone(uint64_t num, PhoneRecord& result) {
+    uint32_t offset = phoneIdx.find(num);
+    if (offset == UINT32_MAX) return false;
+    return db.readAtOffset(offset, result);
+}
+
+// 5. Обновление записи
+bool updatePhone(uint64_t oldNum, uint64_t newNum, const char* newName) {
+    uint32_t offset = phoneIdx.find(oldNum);
+    if (offset == UINT32_MAX) return false;
+
+    PhoneRecord newRec;
+    newRec.set<0>(newNum);
+    newRec.set<1>(newName);
+    return db.updateAtOffset(offset, newRec);
+}
+
+// 6. Удаление по ключу
+bool deletePhone(uint64_t num) {
+    uint32_t offset = phoneIdx.find(num);
+    if (offset == UINT32_MAX) return false;
+    return db.removeAtOffset(offset);
+}
+
+// 7. Полный обход через итератор
+void listAll() {
+    auto it = db.getIterator();
+    PhoneRecord rec;
+    uint32_t offset;
+    while (it.next(rec, &offset)) {
+        Serial.printf("[%u] phone=%llu name=%s\n",
+            offset,
+            (uint64_t)rec.get<0>(),
+            rec.get<1>().toString().c_str());
+    }
+}
+
+// 8. Неблокирующая компактификация в loop()
+void loop() {
+    // Вызывать только когда фрагментация превышает порог
+    if (db.fragPercent() > 30) {
+        bool done = db.compact(512); // 512 байт за итерацию loop()
+        if (done) {
+            Serial.println("Compaction done");
+        }
+    }
+
+    // ... другой код loop
+}
+
+
+/*
+ * =========================================================================
+ * АНАЛИЗ КОДОВОЙ БАЗЫ И ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ
+ * =========================================================================
+ *
+ * 1. ИСПРАВЛЕННЫЕ ПРОБЛЕМЫ
+ * ─────────────────────────
+ *
+ * 1.1 Специализации StructIndex<String, void>::writeKey/readKey
+ *     ПРОБЛЕМА: Специализации метода внутри шаблонного класса невалидны в C++
+ *               (нельзя частично специализировать методы класса без полной
+ *               специализации класса). Код не компилировался бы с -pedantic.
+ *     РЕШЕНИЕ:  Вынесено в свободные функции indexWriteKey<K>/indexReadKey<K>
+ *               с полными специализациями вне класса.
+ *
+ * 1.2 StructCollection::remove() — возвращал false
+ *     ПРОБЛЕМА: Метод был заглушкой без реализации. Нет маппинга index→offset.
+ *     РЕШЕНИЕ:  Новый формат файла с маркерами слотов (0xAA/0xDD + uint32 size)
+ *               позволяет сканировать файл и точно пометить нужный слот.
+ *               Добавлены removeAt(n) и быстрый removeAtOffset(payloadOffset).
+ *
+ * 1.3 StructCollection::update() — некорректный счётчик
+ *     ПРОБЛЕМА: recordCount++ при обновлении (должен оставаться прежним).
+ *     РЕШЕНИЕ:  updateAtOffset() корректно ведёт recordCount/deletedCount.
+ *
+ * 1.4 StructCollection::Iterator — открывал отдельный File, но не закрывал его
+ *     при уничтожении (утечка файловых дескрипторов в LittleFS).
+ *     РЕШЕНИЕ:  Деструктор закрывает файл.
+ *
+ * 1.5 StructCollection::close() — имена файлов индексов
+ *     ПРОБЛЕМА: Все индексы сохранялись в один файл "fname.idx".
+ *     РЕШЕНИЕ:  Имя формируется как "fname.<indexName>.idx".
+ *
+ * 1.6 StructIndex::buildIndex() — не учитывал заголовок файла и старый формат
+ *     ПРОБЛЕМА: Читал с позиции 0, структура могла не распарситься.
+ *     РЕШЕНИЕ:  Читает SCHeader для получения dataEnd, корректно парсит слоты.
+ *
+ * 1.7 StructCollection::rebuildAllIndexes() — скрытый баг
+ *     ПРОБЛЕМА: После временного detach индексов, loop по indicesCopy вызывал
+ *               insert, но attachedIndices уже был очищен — вставки шли в копию,
+ *               а не в реальные индексы (вектор значений, а не указателей).
+ *               Потом attachedIndices = indicesCopy восстанавливал, но вставки
+ *               могли дублироваться.
+ *     РЕШЕНИЕ:  buildIndex() в StructIndex сам читает файл без detach/attach.
+ *
+ *
+ * 2. НОВЫЙ ФОРМАТ ФАЙЛА
+ * ──────────────────────
+ *
+ *  Каждая запись теперь обёрнута в слот:
+ *    [uint8 marker][uint32 payloadSize][payload...NULL_T]
+ *
+ *  marker = 0xAA (SLOT_ACTIVE) или 0xDD (SLOT_DELETED)
+ *
+ *  Это позволяет:
+ *    а) Быстро пропускать записи при сканировании (без полной десериализации)
+ *    б) Помечать запись удалённой одним байтом (без перезаписи данных)
+ *    в) Корректно работать компактификации (точные границы слотов)
+ *
+ *  Цена: +5 байт на запись. При типичной записи 20-200 байт — приемлемо.
+ *
+ *
+ * 3. КОМПАКТИФИКАЦИЯ
+ * ──────────────────
+ *
+ *  Реализована как неблокирующий state machine:
+ *    - Вызов compact(chunkBytes) за итерацию loop()
+ *    - Данные копируются из основного файла во временный (.tmp)
+ *    - По завершении: remove + rename (насколько атомарно позволяет LittleFS)
+ *    - После завершения — полное перестроение индексов (адреса изменились)
+ *
+ *  Ограничение LittleFS: rename() не атомарен при сбое питания.
+ *  Для защиты: при открытии проверять наличие .tmp файла и восстанавливаться.
+ *
+ *
+ * 4. РЕКОМЕНДУЕМЫЕ ДАЛЬНЕЙШИЕ УЛУЧШЕНИЯ
+ * ───────────────────────────────────────
+ *
+ * 4.1 ЗАЩИТА ОТ СБОЯ ПИТАНИЯ при компактификации
+ *     При открытии коллекции проверять наличие fname + ".tmp":
+ *       - Если .tmp есть и валиден → завершить rename (компактификация прервалась на финале)
+ *       - Если .tmp есть и невалиден → удалить (прерыйась в процессе, основной файл цел)
+ *
+ * 4.2 СВОБОДНЫЕ БЛОКИ (free list)
+ *     Для записей фиксированного размера: вести список удалённых слотов
+ *     и переиспользовать их при append() → нулевая фрагментация без компактификации.
+ *     Хранить free list в заголовке (массив смещений) или в отдельном файле.
+ *
+ * 4.3 ТРАНЗАКЦИОННЫЙ ЖУРНАЛ (WAL-lite)
+ *     Для критических данных: перед изменением записывать намерение в .wal файл.
+ *     При открытии — воспроизводить незавершённые транзакции.
+ *     На ESP это дорого (2 записи в FS), но обеспечивает durability.
+ *
+ * 4.4 МУЛЬТИКЛЮЧЕВЫЕ ИНДЕКСЫ
+ *     Заменить std::map на std::multimap для non-unique ключей.
+ *     В IndexBase добавить findAll() → vector<uint32_t>.
+ *     Для удаления из мультиключевого индекса нужно хранить payloadOffset
+ *     в remove(), чтобы удалять конкретный элемент, а не первый совпадающий.
+ *
+ * 4.5 КЭШИРОВАНИЕ ПОСЛЕДНИХ ЗАПИСЕЙ
+ *     Маленький LRU-кэш (2-4 записи) в RAM для горячих данных.
+ *     На ESP8266 с 80KB heap это реально для небольших записей.
+ *
+ * 4.6 CRC32 НА ЗАПИСЬ
+ *     Добавить в слот CRC32 пейлоада:
+ *       [marker][payloadSize][crc32][payload]
+ *     Позволяет детектировать битые записи при сканировании.
+ *     Цена: +4 байта на запись.
+ *
+ * 4.7 СЖАТИЕ СТРОК
+ *     StringEntry с length > 16 байт можно сжимать простым RLE или
+ *     словарным кодированием (общие префиксы телефонных номеров, имён).
+ *     На ESP8266 LZO / heatshrink доступны как библиотеки.
+ *
+ * 4.8 ПАГИНАЦИЯ ИНДЕКСОВ
+ *     При >1000 записей std::map занимает ~20KB RAM (для uint64 ключей).
+ *     Альтернатива: хранить индекс как отсортированный массив в FS,
+ *     загружать только нужные страницы (B-tree страницами по 256 байт).
+ *     Это критично для ESP8266 с 80KB heap.
+ *
+ * 4.9 SCHEMA MIGRATION
+ *     SchemaMigrator в StructBuilder.h содержит заглушку findMigrationPath().
+ *     Реализовать BFS/DFS по графу миграций для автоматического поиска цепочки.
+ *
+ * 4.10 ARENA ALLOCATOR ДЛЯ СТРОК
+ *      StringEntry и ByteArrayEntry используют new/delete на каждую операцию.
+ *      На ESP это фрагментирует heap. Лучше: pool allocator или static буфер
+ *      для строк ≤32 байт (SSO — Small String Optimization).
+ *
+ *
+ * 5. ОЦЕНКА ПОТРЕБЛЕНИЯ РЕСУРСОВ
+ * ────────────────────────────────
+ *
+ *  При 500 записях с uint64 ключом:
+ *    std::map<uint64_t, uint32_t>: ~500 * (8+4+3*ptr) ≈ 500 * 28 = 14 KB RAM
+ *    На ESP8266 (80KB free heap) — приемлемо для 1-2 индексов.
+ *    На ESP32 (300KB+ free heap) — без ограничений до ~5000 записей.
+ *
+ *  Для ESP8266 с >500 записями рекомендуется реализация 4.8 (B-tree в FS).
+ *
+ *
+ * 6. ЗАМЕЧАНИЯ К CompactPhone.h
+ * ─────────────────────────────
+ *
+ *  - VAR_CLOUDE-вариант имеет правильный порядок полей (num в LSB), что
+ *    обеспечивает корректную сортировку по raw значению при сравнении по phone().
+ *  - Оператор< сравнивает phone(), что корректно для индексирования.
+ *  - Конструктор из String делает sscanf("%llu") — на ESP8266 убедитесь,
+ *    что newlib поддерживает %llu (в некоторых сборках нет).
+ *    Альтернатива: strtoull().
+ *  - PackedPhone можно напрямую использовать как ключ UInt64Index:
+ *      UInt64Index<MyRecord> idx([](const MyRecord& r) -> uint64_t {
+ *          PackedPhone pp(r.get<0>());
+ *          return pp.phone(); // индексировать по номеру без flags/group
+ *      });
+ */
