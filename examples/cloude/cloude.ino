@@ -1,13 +1,5 @@
-/*
- * StructDB — пример использования + анализ и предложения по улучшению
- * =========================================================================
- * Для ESP8266 / ESP32, LittleFS
- */
+// ── Пример реализации базы данных для телефонов ─────
 
-// ── Пример использования ────────────────────────────────────────────────────
-
-#include "StructCollection.h"
-#include "StructIndex.h"
 #include "CompactPhone.h"
 #include "phoneDb.h"
 
@@ -28,7 +20,7 @@ void setup() {
     phonebook.begin("/phonebook.db");
     phonebook.clean("/phonebook.db");
 
-        Busybox::ls("/");
+    Busybox::ls("/");
     Busybox::view("/phonebook.db");
 
     // ── Добавление ─────────────────────────────────────────────────────────
@@ -90,8 +82,8 @@ void setup() {
     phonebook.updateDescription(79161234567ULL, "Иван Петрович");
 
     phonebook.printStats();
-    Busybox::ls("/");
-    Busybox::view("/phonebook.db");
+    // Busybox::ls("/");
+    // Busybox::view("/phonebook.db");
 
     // ── Обход всех записей ─────────────────────────────────────────────────
     Serial.println("=== Все записи ===");

@@ -126,22 +126,11 @@ private:
         return _fname + "." + name + ".idx";
     }
 
-    // ── ИСПРАВЛЕННЫЙ _writeSlot ───────────────────────────────────────────────
-    // FIX BUG-2: serialize в RAM-буфер → один write, без seek-назад.
-    // Для записей > SC_MAX_INLINE_RECORD — seekback схема с явными проверками.
-    //
+
     // Возвращает slotStart (смещение маркера) или UINT32_MAX при ошибке.
     uint32_t _writeSlot(File& dst, const StructType& rec) {
         uint32_t slotStart = dst.position();
 
-        // ── Быстрый путь: сериализация в стековый буфер ──────────────────────
-        // TestStream-подобный класс для измерения размера не нужен —
-        // используем временный FileStream в буфере.
-        // Вместо этого: пишем в специальный CountingStream для получения размера.
-        //
-        // Но проще: пишем placeholder, payload, потом seekback.
-        // Исправление BUG-2: явно проверяем что seek+write прошли успешно,
-        // и финальный seek возвращает на конец записи.
 
         uint8_t  marker          = SLOT_ACTIVE;
         uint32_t sizePlaceholder = 0;
@@ -161,7 +150,6 @@ private:
         if (dst.write((uint8_t*)&payloadSize, 4) != 4) return UINT32_MAX;
 
         // КРИТИЧНО: восстановить позицию на конец payload!
-        // BUG-2 был здесь — без этого seek position оставалась после size-поля.
         if (!dst.seek(payloadEnd)) return UINT32_MAX;
 
         return slotStart;
@@ -276,6 +264,10 @@ public:
         return true;
     }
 
+    inline void flush(){
+        _file.flush();
+    }
+
     // ── Добавить запись ───────────────────────────────────────────────────────
     bool append(const StructType& rec) {
         if (!_open || _compacting) return false;
@@ -290,7 +282,7 @@ public:
         _writeHeader();
 
         _notifyInsert(rec, payloadOffset);
-        _file.flush();
+        flush();
         return true;
     }
 
@@ -382,7 +374,7 @@ public:
 
         _notifyRemove(oldRec);
         _notifyInsert(newRec, newPayloadOff);
-        _file.flush();
+        flush();
         return true;
     }
 
